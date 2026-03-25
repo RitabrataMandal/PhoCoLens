@@ -4,12 +4,14 @@ Convention
 ours/naive-fft-(fft_h-fft_w)-learn-(learn_h-learn_w)-meas-(meas_h-meas-w)-kwargs
 
 * Phlatcam: 1518 x 2012 (post demosiacking)
+* DTU: 512 x 640 (Height x Width)
 """
 from pathlib import Path
 import torch
 from types import SimpleNamespace
 
 # Define FFT arguments once at the module level
+# These are defaults for Phlatcam. They will be overridden for DTU.
 fft_args_dict = {
     "psf_mat": Path("data/phlatcam/phase_psf/psf.npy"),
     "psf_height": 1518,
@@ -109,6 +111,7 @@ def base_config():
     # ---------------------------------------------------------------------------- #
     # See models/get_model.py for registry
     model = "unet-128-pixelshuffle-invert"
+    # model = "srresnet"
     pixelshuffle_ratio = 2
     grad_lambda = 0.0
   
@@ -119,7 +122,7 @@ def base_config():
     # ---------------------------------------------------------------------------- #
     # Loss
     # ---------------------------------------------------------------------------- #
-    lambda_contextual = 0.0
+    lambda_contextual = 0.1  # 0.1
     lambda_perception = 1.2  # 0.006
     lambda_image = 1  # mse
     lambda_l1 = 0 # l1
@@ -142,7 +145,7 @@ def base_config():
     distdataparallel = False
     val_train = False
     
-    static_val_image = "n02165456_10030.png"
+    static_val_image = "rect_001_0_r5000.png" # Updated placeholder for DTU
 
 
 def ours_meas_1280_1408_svd():
@@ -164,18 +167,104 @@ def ours_meas_1280_1408_decoded_sim_svd():
     multi = 9
     load_raw = True
 
+# --- NEW CONFIGURATION FOR DTU ---
+def ours_dtu_svd():
+    exp_name = "dtu-svd-v3"
+    dataset_name = "dtu"
+
+    # --- Dimensions (H=512, W=640) ---
+    # NOTE: PyTorch uses (H, W). Numpy/OpenCV use (H, W).
+    image_height = 512
+    image_width = 640
+    
+    meas_height = 512
+    meas_width = 640
+    
+    psf_height = 512
+    psf_width = 640
+    
+    # Centers (Half of H and W)
+    psf_centre_x = 256  # H / 2
+    psf_centre_y = 320  # W / 2
+    meas_centre_x = 256
+    meas_centre_y = 320
+    
+    # Crops - Full size (No cropping needed)
+    psf_crop_size_x = 512
+    psf_crop_size_y = 640
+    meas_crop_size_x = 512
+    meas_crop_size_y = 640
+    
+    # --- Paths ---
+    # Update this to where your 'mvs_training' folder is located
+    image_dir = Path("/mnt/data/Ritabrata/MVSGaussian/mvs_training/dtu") 
+    # image_dir =  Path("/mnt/data/Ritabrata/SPFSplat/datasets/dtu/dtu/lensless")
+    
+    # Update this to your resized 640x512 PSF file
+    psf_mat = Path("psf_640x512.npy")
+    
+    output_dir = Path("output/dtu") / exp_name
+    ckpt_dir = Path("ckpts/dtu") / exp_name
+    run_dir = Path("runs/dtu") / exp_name
+
+    # --- Flags ---
+    load_raw = False         # Inputs are PNGs
+    use_spatial_weight = True # Enable SVDeconv grid
+    multi = 9                # 3x3 kernels
+    batch_size = 4          # Adjust for VRAM
+    
+    # Static image for validation visualization (use a real name from your dataset)
+    static_val_image = "rect_001_0_r5000.png" 
+
+def ours_re10k_svd():
+    exp_name = "re10k-svd-v1"
+    dataset_name = "re10k"
+    
+    # --- Dimensions (H=360, W=640) ---
+    # NOTE: PyTorch uses (H, W). Numpy/OpenCV use (H, W).
+    image_height = 384
+    image_width = 640
+    
+    meas_height = 360
+    meas_width = 640
+    
+    psf_height = 384
+    psf_width = 640
+    
+    # Centers (Half of H and W)
+    psf_centre_x = 192  # H / 2
+    psf_centre_y = 320  # W / 2
+    meas_centre_x = 192 
+    meas_centre_y = 320
+    
+    # Crops - Full size (No cropping needed)
+    psf_crop_size_x = 360
+    psf_crop_size_y = 640
+    meas_crop_size_x = 360
+    meas_crop_size_y = 640
+    
+    # --- Paths ---
+    # Update this to where your 'mvs_training' folder is located
+    image_dir = Path("/mnt/data/Ritabrata/SPFSplat/datasets/re10k") 
+    
+    # Update this to your resized 640x384 PSF file!
+    psf_mat = Path("psf_640x384.npy")
+    
+    output_dir = Path("output/re10k") / exp_name
+    ckpt_dir = Path("ckpts/re10k") / exp_name
+    run_dir = Path("runs/re10k") / exp_name
+
+    # --- Flags ---
+    load_raw = False         # Inputs are PNGs
+    use_spatial_weight = True # Enable SVDeconv grid
+    multi = 9                # 3x3 kernels
+    batch_size = 4          # Adjust for VRAM
+    
+    # Static image for validation visualization (use a real name from your dataset)
+    static_val_image = "rect_001_0_r5000.png"
+
 def load_ckpt():
     exp_name = "fft-svd-1280-1408-learn-1280-1408-meas-decoded_sim_spatial_weight"
-
-# def ours_meas_1280_1408_decoded_sim():
-#     exp_name = "fft-svd-1280-1408-meas-decoded_sim_spatial_weight"
-#     train_target_list =  "data/text_files/decoded_sim_captures_train.txt"
-#     val_target_list = "data/text_files/decoded_sim_captures_val.txt"
-#     batch_size = 5
-#     num_threads = 5
-#     use_spatial_weight = True
-#     multi = 9
-#     load_raw = True
 
 def infer_train():
     val_train = True
@@ -185,7 +274,9 @@ named_config_ll = [
     ours_meas_1280_1408_svd,
     ours_meas_1280_1408_decoded_sim_svd,
     infer_train,
-    load_ckpt
+    load_ckpt,
+    ours_dtu_svd,
+    ours_re10k_svd
 ]
 
 

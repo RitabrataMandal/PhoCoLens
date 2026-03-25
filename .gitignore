@@ -6,8 +6,10 @@ NullSpaceDiff/logs/*
 NullSpaceDiff/scripts_bk/*
 __pycache__/*
 */__pycache__/*
-SVDeconv/output*
+output/
 SVDeconv/runs*
 SVDeconv/data/*
 *.pyc
 */logs
+src/
+runs/

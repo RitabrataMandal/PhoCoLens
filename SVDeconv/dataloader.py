@@ -20,6 +20,9 @@ from config import initialise
 from pathlib import Path
 from datasets.phlatcam import PhaseMaskDataset
 from datasets.diffusercam import LenslessLearningCollection
+from datasets.dtu import DTUDataset
+from datasets.re10k import RE10KDataset
+
 if TYPE_CHECKING:
     from utils.typing_alias import *
 
@@ -50,6 +53,14 @@ def get_dataloaders(args, is_local_rank_0: bool = True):
         val_dataset = dataset.val_dataset
         test_dataset = dataset.val_dataset
         # print("here")
+    elif "dtu" in args.dataset_name:
+        train_dataset = DTUDataset(args, mode="train")
+        val_dataset = DTUDataset(args, mode="test")
+        test_dataset = DTUDataset(args, mode="test")
+    elif "re10k" in args.dataset_name:
+        train_dataset = RE10KDataset(args, mode="train")
+        val_dataset = RE10KDataset(args, mode="test")
+        test_dataset = RE10KDataset(args, mode="test")
     if is_local_rank_0:
         logging.info(
             f"Dataset: {args.dataset_name} Len Train: {len(train_dataset)} Val: {len(val_dataset)}  Test: {len(test_dataset)}"

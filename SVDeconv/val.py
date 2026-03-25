@@ -60,13 +60,11 @@ def main(_run):
     args = tupperware(_run.config)
     args.batch_size = 1
 
-    # Set device, init dirs
+    # Set device
     device = args.device
-    # dir_init(args)
 
     # ADMM or not
     interm_name = "fft" 
-
 
     # Get data
     data = get_dataloaders(args)
@@ -74,34 +72,42 @@ def main(_run):
     # Model
     G, FFT = get_model.model(args)
 
-    ckpt_dir = Path("ckpts/phlatcam") / args.exp_name
+    # --- PATH CONFIGURATION ---
+    ckpt_dir = args.ckpt_dir 
+    
     model_gen_path = ckpt_dir / "model_latest.pth"
     model_fft_path = ckpt_dir / "FFT_latest.pth"
-    print("model_gen_path.exists()", model_gen_path.exists(), "model_fft_path.exists()", model_fft_path.exists())
-    print("model_gen_path", model_gen_path, "model_fft_path", model_fft_path)
-    if  model_gen_path.exists() and model_fft_path.exists():
+    
+    print(f"Looking for checkpoints at: {ckpt_dir}")
+    
+    # --- MANUAL LOADING (Robust) ---
+    global_step = 0 # Default initialization
+    start_epoch = 0
+    
+    if model_gen_path.exists() and model_fft_path.exists():
         logging.info(f"Loading model from {model_gen_path}")
         gen_ckpt = torch.load(model_gen_path, map_location=torch.device("cpu"))
         fft_ckpt = torch.load(model_fft_path, map_location=torch.device("cpu"))
 
-    #     # G.load_state_dict(gen_ckpt["state_dict"])
         load_state_dict(G, gen_ckpt["state_dict"])
         load_state_dict(FFT, fft_ckpt["state_dict"])
+        
+        # Extract metadata if available
+        if 'global_step' in gen_ckpt:
+            global_step = gen_ckpt['global_step']
+        if 'epoch' in gen_ckpt:
+            start_epoch = gen_ckpt['epoch']
+            
+    else:
+        logging.error(f"Checkpoints not found at {model_gen_path}")
+        # Don't return, just warn (allows testing untrained models if needed)
+        # return 
 
     G = G.to(device)
     FFT = FFT.to(device)
 
     # LPIPS Criterion
     lpips_criterion = loss_fn_alex.to(device)
-
-    # Load Models
-    (G, FFT), _, global_step, start_epoch, loss = load_models(
-        G,
-        FFT,
-        g_optimizer=None,
-        fft_optimizer=None,
-        args=args,
-    )
 
     _metrics_dict = {
         "PSNR": 0.0,
@@ -112,17 +118,26 @@ def main(_run):
     }
     avg_metrics = AvgLoss_with_dict(loss_dict=_metrics_dict, args=args)
 
+    # Switch to train loader if requested
     if args.val_train:
-        logging.info("Validating on train set.")
-        data.val_loader = data.train_loader
+        logging.info("Generating output for TRAIN set.")
+        loader = data.train_loader
+        # Adjust output path
+        val_path = args.output_dir / "train_output"
+    else:
+        logging.info("Generating output for VAL set.")
+        loader = data.val_loader
+        val_path = args.output_dir / "val_output"
         
-    logging.info(
-        f"Loaded experiment {args.exp_name}, dataset {args.dataset_name}, trained for {start_epoch} epochs."
-    )
+    logging.info(f"Saving results to: {val_path}")
+    val_path.mkdir(exist_ok=True, parents=True)
   
-    # Run val for an epoch
     avg_metrics.reset()
-    pbar = tqdm(range(len(data.val_loader) * args.batch_size), dynamic_ncols=True)
+    
+    # Calculate total batches for tqdm
+    # loader might be None if dataset is empty, though unlikely here
+    total_batches = len(loader) if loader else 0
+    pbar = tqdm(range(total_batches * args.batch_size), dynamic_ncols=True)
 
     if args.device == "cuda:0":
         start = torch.cuda.Event(enable_timing=True)
@@ -130,28 +145,28 @@ def main(_run):
     else:
         start = end = 0
 
-    # Val and test paths
-    val_path = args.output_dir / "val" if not args.val_train else args.output_dir / "train"
-    val_path.mkdir(exist_ok=True, parents=True)
-
- 
-
     acc_time = 0.0
     with torch.no_grad():
         G.eval()
         FFT.eval()
-        for i, batch in enumerate(data.val_loader):
+        for i, batch in enumerate(loader):
             metrics_dict = defaultdict(float)
 
-            source, target, filename = batch
-            source, target = (source.to(device), target.to(device))
+            # Robust unpacking for 2 or 3 items
+            if len(batch) == 3:
+                source, target, filename = batch
+                target = target.to(device)
+            else:
+                source, filename = batch
+                target = None # Handle missing target gracefully
+
+            source = source.to(device)
 
             if args.device == "cuda:0" and i:
                 start.record()
             start_time = time.time()
-            fft_output = FFT(source)
             
-          
+            fft_output = FFT(source)
 
             # Unpixelshuffle
             fft_unpixel_shuffled = unpixel_shuffle(fft_output, args.pixelshuffle_ratio)
@@ -168,65 +183,61 @@ def main(_run):
             else:
                 metrics_dict["Time"] = 0.0
 
-            # PSNR
-            metrics_dict["PSNR"] += PSNR(output, target).item()
-          
-            metrics_dict["LPIPS_01"] += lpips_criterion(
-                output.mul(0.5).add(0.5), target.mul(0.5).add(0.5)
-            ).mean().item()
-            # print(filename, lpips_criterion(
-            #     output.mul(0.5).add(0.5), target.mul(0.5).add(0.5)
-            # ).mean().item())
-            metrics_dict["LPIPS_11"] += lpips_criterion(output, target).mean().item()
+            # Metrics
+            if target is not None:
+                metrics_dict["PSNR"] += PSNR(output, target).item()
+                metrics_dict["LPIPS_01"] += lpips_criterion(
+                    output.mul(0.5).add(0.5), target.mul(0.5).add(0.5)
+                ).mean().item()
+                metrics_dict["LPIPS_11"] += lpips_criterion(output, target).mean().item()
 
             for e in range(args.batch_size):
-                # Compute SSIM
-                fft_output_vis = []
-     
-      
-                in_c = fft_output[e].shape[0]
-                for i in range(in_c // 4):
-                    fft_output_vis.append(rggb_2_rgb(fft_output[e][4*i:4*i+4]).mul(0.5).add(0.5))
-
-                for i in range(len(fft_output_vis)):
-                    fft_output_vis[i] = (fft_output_vis[i] - fft_output_vis[i].min()) / (
-                        fft_output_vis[i].max() - fft_output_vis[i].min()
-                    )
-                    fft_output_vis[i] = fft_output_vis[i].permute(1, 2, 0).cpu().detach().numpy()
-
-
+                # Visuals
                 output_numpy = (
                     output[e].mul(0.5).add(0.5).permute(1, 2, 0).cpu().detach().numpy()
                 )
-                target_numpy = (
-                    target[e].mul(0.5).add(0.5).permute(1, 2, 0).cpu().detach().numpy()
-                )
-                metrics_dict["SSIM"] += ssim(
-                    target_numpy, output_numpy, multichannel=True, data_range=1.0,channel_axis = -1
-                )
-
-                # Dump to output folder
-                name = filename[e].replace(".JPEG", ".png")
-                parent = name.split("_")[0]
-                path = val_path / parent
-                path.mkdir(exist_ok=True, parents=True)
-                path_output = path / ("output_" + name)
-                path_fft = path / (f"{interm_name}_" + name)
-
+                
+                # Filename now comes as "scanX/image.png"
+                full_name = str(filename[e])
+                
+                # 1. Extract Scene and Image Name
+                if "/" in full_name:
+                    scan_folder, img_name = full_name.split("/")[-2:] 
+                else:
+                    # Fallback if no folder structure found
+                    scan_folder = "unknown_scan"
+                    img_name = full_name
+                
+                img_name = img_name.replace(".JPEG", ".png") # Ensure PNG extension
+                
+                # 2. Create Scene Directory inside Output Dir
+                # Result: output/dtu/.../val_output/scan2_train/
+                scene_save_path = val_path / scan_folder
+                scene_save_path.mkdir(exist_ok=True, parents=True)
+                
+                path_output = scene_save_path / img_name
+                
+                # 3. Save (Clipped & Casted)
                 cv2.imwrite(
-                    str(path_output), (output_numpy[:, :, ::-1] * 255.0).astype(int)
+                    str(path_output), (np.clip(output_numpy, 0, 1)[:, :, ::-1] * 255.0).astype(np.uint8)
                 )
-                for i in range(len(fft_output_vis)):
-                    cv2.imwrite(
-                        str(path_fft).replace(".png", f"_{i}.png"), (fft_output_vis[i][:, :, ::-1] * 255.0).astype(int)
+                
+                # SSIM Calculation (No changes needed here)
+                if target is not None:
+                    target_numpy = (
+                        target[e].mul(0.5).add(0.5).permute(1, 2, 0).cpu().detach().numpy()
                     )
-              
-            metrics_dict["SSIM"] = metrics_dict["SSIM"] / args.batch_size
-            avg_metrics += metrics_dict
+                    metrics_dict["SSIM"] += ssim(
+                        target_numpy, output_numpy, multichannel=True, data_range=1.0, channel_axis=-1
+                    )
+
+            if target is not None:
+                metrics_dict["SSIM"] = metrics_dict["SSIM"] / args.batch_size
+                avg_metrics += metrics_dict
 
             pbar.update(args.batch_size)
             pbar.set_description(
-                f"Val Epoch : {start_epoch} Step: {global_step}| PSNR: {avg_metrics.loss_dict['PSNR']:.3f} | SSIM: {avg_metrics.loss_dict['SSIM']:.3f} | LPIPS_01: {avg_metrics.loss_dict['LPIPS_01']:.3f}| LPIPS_11: {avg_metrics.loss_dict['LPIPS_11']:.3f}"
+                f"Val Step: {global_step}| PSNR: {avg_metrics.loss_dict['PSNR']:.3f} | SSIM: {avg_metrics.loss_dict['SSIM']:.3f}"
             )
 
         with open(val_path / "metrics.txt", "w") as f:
@@ -237,66 +248,3 @@ def main(_run):
             ]
             L = L + [f"{k}:{v}\n" for k, v in avg_metrics.loss_dict.items()]
             f.writelines(L)
-        # print("acc_time", acc_time)
-        # if data.test_loader:
-        #     pbar = tqdm(
-        #         range(len(data.test_loader) * args.batch_size), dynamic_ncols=True
-        #     )
-        #     for i, batch in enumerate(data.test_loader):
-
-        #         source, filename = batch
-        #         source = source.to(device)
-
-        #         fft_output = FFT(source)
-
-
-        #         # Unpixelshuffle
-        #         fft_unpixel_shuffled = unpixel_shuffle(
-        #             fft_output, args.pixelshuffle_ratio
-        #         )
-        #         output_unpixel_shuffled = G(fft_unpixel_shuffled)
-
-        #         output = F.pixel_shuffle(
-        #             output_unpixel_shuffled, args.pixelshuffle_ratio
-        #         )
-
-        #         for e in range(args.batch_size):
-        #             fft_output_vis = rggb_2_rgb(fft_output[e]).mul(0.5).add(0.5)
-                
-
-        #             fft_output_vis = (fft_output_vis - fft_output_vis.min()) / (
-        #                 fft_output_vis.max() - fft_output_vis.min()
-        #             )
-
-        #             fft_output_vis = (
-        #                 fft_output_vis.permute(1, 2, 0).cpu().detach().numpy()
-        #             )
-
-        #             output_numpy = (
-        #                 output[e]
-        #                 .mul(0.5)
-        #                 .add(0.5)
-        #                 .permute(1, 2, 0)
-        #                 .cpu()
-        #                 .detach()
-        #                 .numpy()
-        #             )
-        #             # Dump to output folder
-        #             # Phase and amplitude are nested
-        #             name = filename[e].replace(".JPEG", ".png")
-        #             parent, name = name.split("/")
-        #             path = test_path / parent
-        #             path.mkdir(exist_ok=True, parents=True)
-        #             path_output = path / ("output_" + name)
-        #             path_fft = path / (f"{interm_name}_" + name)
-        #             cv2.imwrite(
-        #                 str(path_output),
-        #                 (output_numpy[:, :, ::-1] * 255.0).astype(np.int),
-        #             )
-        #             cv2.imwrite(
-        #                 str(path_fft),
-        #                 (fft_output_vis[:, :, ::-1] * 255.0).astype(np.int),
-        #             )
-
-        #         pbar.update(args.batch_size)
-        #         pbar.set_description(f"Test Epoch : {start_epoch} Step: {global_step}")

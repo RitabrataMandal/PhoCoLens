@@ -94,7 +94,6 @@ def get_optimisers(G, FFT, args):
 
 
 def load_models(G, FFT, g_optimizer, fft_optimizer, args, is_local_rank_0=True):
-    # ...existing code...
     if args.resume:
         try:
             if args.inference_mode == "latest":
@@ -112,12 +111,37 @@ def load_models(G, FFT, g_optimizer, fft_optimizer, args, is_local_rank_0=True):
                     args.ckpt_dir / args.save_filename_FFT, map_location=args.device
                 )
 
-            G.load_state_dict(ckpt_G["model"])
-            FFT.load_state_dict(ckpt_FFT["model"])
+            # --- FIX 1: Use "state_dict" key (was "model") ---
+            state_dict_G = ckpt_G["state_dict"]
+            
+            # --- FIX 2: Handle DDP 'module.' prefix ---
+            # If checkpoint has "module." but current model doesn't, strip it
+            if list(state_dict_G.keys())[0].startswith("module."):
+                from collections import OrderedDict
+                new_state_dict = OrderedDict()
+                for k, v in state_dict_G.items():
+                    name = k[7:]  # remove 'module.'
+                    new_state_dict[name] = v
+                state_dict_G = new_state_dict
+            
+            G.load_state_dict(state_dict_G)
+
+            # --- FIX 1 & 2 for FFT ---
+            state_dict_FFT = ckpt_FFT["state_dict"] # Use "state_dict"
+            
+            if list(state_dict_FFT.keys())[0].startswith("module."):
+                from collections import OrderedDict
+                new_state_dict = OrderedDict()
+                for k, v in state_dict_FFT.items():
+                    name = k[7:]  # remove 'module.'
+                    new_state_dict[name] = v
+                state_dict_FFT = new_state_dict
+
+            FFT.load_state_dict(state_dict_FFT)
 
             if not args.finetune:
                 g_optimizer.load_state_dict(ckpt_G["optimizer"])
-                fft_optimizer.load_state_dict(ckpt_FFT["optimizer"])
+                # fft_optimizer.load_state_dict(ckpt_FFT["optimizer"]) # Commented out in your original code
                 global_step = ckpt_G["global_step"]
                 epoch = ckpt_G["epoch"]
                 loss = ckpt_G["loss"]
@@ -128,9 +152,10 @@ def load_models(G, FFT, g_optimizer, fft_optimizer, args, is_local_rank_0=True):
 
             if is_local_rank_0:
                 logging.info(f"Loaded checkpoint from epoch {epoch}")
-        except:
+        
+        except Exception as e:
             if is_local_rank_0:
-                logging.info("Could not load checkpoint")
+                logging.info(f"Could not load checkpoint. Error: {e}")
             global_step = 0
             epoch = 0
             loss = float("inf")

@@ -126,11 +126,11 @@ def main(_run):
         )
 
     writer = SummaryWriter(log_dir=str(args.run_dir))
-    writer.add_text("Args", pprint_args(args))
-
+    
     # Log no of GPUs
     if is_local_rank_0:
-        world_size = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+        if "WORLD_SIZE" in os.environ:
+            world_size = int(os.environ["WORLD_SIZE"])
         logging.info("Using {} GPUs".format(world_size))
         writer.add_text("Args", pprint_args(args))
 
@@ -274,7 +274,6 @@ def main(_run):
                 loss_dict["image_loss"] += g_loss.image_loss
 
                 # For test set, reduction is wasteful
-                # Much larger, probably evens out
                 exp_loss += reduce_loss_dict(loss_dict, world_size=1)
                 global_step += args.batch_size * world_size
 
@@ -286,7 +285,7 @@ def main(_run):
                     )
 
                     # Write lr rates and metrics
-                    if is_local_rank_0 and i % (args.log_interval) == 0:
+                    if i % (args.log_interval) == 0:
                         gen_lr = g_optimizer.param_groups[0]["lr"]
                         writer.add_scalar("lr/gen", gen_lr, global_step)
 
@@ -303,13 +302,13 @@ def main(_run):
                                 global_step,
                             )
 
-                        n = np.min([3, args.batch_size])
-                        for e in range(n):
-                            if not is_admm:
+                        n_vis = np.min([3, source.shape[0]])
+                        for e in range(n_vis):
+                            # Check if we should use RGB conversion (for Raw data)
+                            # or direct usage (for pre-processed RGB data like DTU)
+                            if not is_admm and args.load_raw:
                                 source_vis = rggb_2_rgb(source[e]).mul(0.5).add(0.5)
-                                fft_output_vis = (
-                                    rggb_2_rgb(fft_output[e]).mul(0.5).add(0.5)
-                                )
+                                fft_output_vis = rggb_2_rgb(fft_output[e]).mul(0.5).add(0.5)
                             else:
                                 source_vis = source[e].mul(0.5).add(0.5)
                                 fft_output_vis = fft_output[e].mul(0.5).add(0.5)
@@ -351,12 +350,9 @@ def main(_run):
 
                 # Save checkpoint
                 if is_local_rank_0 and (i % args.save_ckpt_interval == 0):
-
                     logging.info(
                         f"Saving weights at epoch {epoch + 1} global step {global_step}"
                     )
-
-                    # Save weights
                     save_weights(
                         epoch=epoch,
                         global_step=global_step,
@@ -370,6 +366,9 @@ def main(_run):
                         is_local_rank_0=True,
                     )
 
+            # ------------------------------- #
+            # VALIDATION LOOP
+            # ------------------------------- #
             with torch.no_grad():
                 G.eval()
                 FFT.eval()
@@ -398,12 +397,10 @@ def main(_run):
                     fft_output = FFT(source)
 
                     if is_admm:
-                        # Upsample
                         fft_output = F.interpolate(
                             fft_output, scale_factor=4, mode="nearest"
                         )
 
-                    # Unpixelshuffle
                     fft_unpixel_shuffled = unpixel_shuffle(
                         fft_output, args.pixelshuffle_ratio
                     )
@@ -435,7 +432,7 @@ def main(_run):
 
                     metrics_dict["g_loss"] += g_loss.total_loss
 
-                    # Save image
+                    # Save image logic
                     if args.static_val_image in filename:
                         filename_static = filename
                         source_static = source
@@ -443,7 +440,6 @@ def main(_run):
                         target_static = target
                         output_static = output
 
-                    # PSNR
                     metrics_dict["PSNR"] += PSNR(output, target)
                     avg_metrics += reduce_loss_dict(metrics_dict, world_size=world_size)
 
@@ -460,9 +456,12 @@ def main(_run):
                             avg_metrics.loss_dict[metric],
                             global_step,
                         )
-                    n = np.min([3, args.batch_size])
-                    for e in range(n):
-                        if not is_admm:
+                    
+                    # Use actual batch size for visualization range to prevent index errors
+                    n_vis = np.min([3, source.shape[0]])
+                    
+                    for e in range(n_vis):
+                        if not is_admm and args.load_raw:
                             source_vis = rggb_2_rgb(source[e]).mul(0.5).add(0.5)
                             fft_output_vis = rggb_2_rgb(fft_output[e]).mul(0.5).add(0.5)
                         else:
@@ -485,7 +484,6 @@ def main(_run):
                             fft_output_vis.cpu().detach(),
                             global_step,
                         )
-
                         writer.add_image(
                             f"Source/Val_{e+1}", source_vis.cpu().detach(), global_step
                         )
@@ -495,20 +493,15 @@ def main(_run):
                         writer.add_image(
                             f"Output/Val_{e+1}", output_vis.cpu().detach(), global_step
                         )
-
                         writer.add_text(
                             f"Filename/Val_{e + 1}", filename[e], global_step
                         )
 
                     for e, filename in enumerate(filename_static):
                         if filename == args.static_val_image:
-                            if not is_admm:
-                                source_vis = (
-                                    rggb_2_rgb(source_static[e]).mul(0.5).add(0.5)
-                                )
-                                fft_output_vis = (
-                                    rggb_2_rgb(fft_output_static[e]).mul(0.5).add(0.5)
-                                )
+                            if not is_admm and args.load_raw:
+                                source_vis = rggb_2_rgb(source_static[e]).mul(0.5).add(0.5)
+                                fft_output_vis = rggb_2_rgb(fft_output_static[e]).mul(0.5).add(0.5)
                             else:
                                 source_vis = source_static[e].mul(0.5).add(0.5)
                                 fft_output_vis = fft_output_static[e].mul(0.5).add(0.5)
@@ -552,14 +545,12 @@ def main(_run):
                         f"Saving weights at END OF epoch {epoch + 1} global step {global_step}, the PSNR is {avg_metrics.loss_dict['PSNR']:.3f}"
                     )
 
-                    # Save weights
                     if avg_metrics.loss_dict["g_loss"] < loss:
                         is_min = True
                         loss = avg_metrics.loss_dict["g_loss"]
                     else:
                         is_min = False
 
-                    # Save weights
                     save_weights(
                         epoch=epoch,
                         global_step=global_step,
@@ -573,131 +564,79 @@ def main(_run):
                         tag="best",
                     )
 
-                # Test
-                # if not data.test_loader:
-                #     continue
+                # ------------------------------- #
+                # TEST LOOP (FIXED)
+                # ------------------------------- #
+                if data.test_loader:
+                    if is_local_rank_0:
+                        test_pbar.reset()
 
-                # filename_static = []
-                # if is_local_rank_0:
-                #     test_pbar.reset()
+                    for i, batch in enumerate(data.test_loader):
+                        # Robust Unpacking (2 or 3 items)
+                        if len(batch) == 3:
+                            source, target, filename = batch
+                            target = target.to(rank)
+                        else:
+                            source, filename = batch
+                            target = None
+                        
+                        source = source.to(rank)
 
-                # for i, batch in enumerate(data.test_loader):
-                #     source, filename = batch
-                #     source = source.to(rank)
+                        fft_output = FFT(source)
 
-                #     fft_output = FFT(source)
+                        if is_admm:
+                            fft_output = F.interpolate(
+                                fft_output, scale_factor=4, mode="nearest"
+                            )
 
-                #     if is_admm:
-                #         # Upsample
-                #         fft_output = F.interpolate(
-                #             fft_output, scale_factor=4, mode="nearest"
-                #         )
+                        fft_unpixel_shuffled = unpixel_shuffle(
+                            fft_output, args.pixelshuffle_ratio
+                        )
+                        output_unpixel_shuffled = G(fft_unpixel_shuffled)
 
-                #     # Unpixelshuffle
-                #     fft_unpixel_shuffled = unpixel_shuffle(
-                #         fft_output, args.pixelshuffle_ratio
-                #     )
-                #     output_unpixel_shuffled = G(fft_unpixel_shuffled)
+                        output = F.pixel_shuffle(
+                            output_unpixel_shuffled, args.pixelshuffle_ratio
+                        )
 
-                #     output = F.pixel_shuffle(
-                #         output_unpixel_shuffled, args.pixelshuffle_ratio
-                #     )
+                        if is_local_rank_0:
+                            test_pbar.update(args.batch_size)
+                            test_pbar.set_description(
+                                f"Test Epoch : {epoch + 1} Step: {global_step}"
+                            )
+                    
+                    # End of Test Loop Visualization
+                    if is_local_rank_0:
+                        # Use ACTUAL batch size to prevent IndexError
+                        n_vis = np.min([3, source.shape[0]])
+                        
+                        for e in range(n_vis):
+                            # Check raw loading logic
+                            if not is_admm and args.load_raw:
+                                source_vis = rggb_2_rgb(source[e]).mul(0.5).add(0.5)
+                                fft_output_vis = rggb_2_rgb(fft_output[e]).mul(0.5).add(0.5)
+                            else:
+                                source_vis = source[e].mul(0.5).add(0.5)
+                                fft_output_vis = fft_output[e].mul(0.5).add(0.5)
 
-                #     # Save image
-                #     if args.static_test_image in filename:
-                #         filename_static = filename
-                #         source_static = source
-                #         fft_output_static = fft_output
-                #         output_static = output
+                            fft_output_vis = (fft_output_vis - fft_output_vis.min()) / (
+                                fft_output_vis.max() - fft_output_vis.min()
+                            )
+                            output_vis = output[e].mul(0.5).add(0.5)
 
-                #     if is_local_rank_0:
-                #         test_pbar.update(args.batch_size)
-                #         test_pbar.set_description(
-                #             f"Test Epoch : {epoch + 1} Step: {global_step}"
-                #         )
-
-                # if is_local_rank_0:
-                #     n = np.min([3, args.batch_size])
-                #     for e in range(n):
-                #         if not is_admm:
-                #             source_vis = rggb_2_rgb(source[e]).mul(0.5).add(0.5)
-                #             fft_output_vis = rggb_2_rgb(fft_output[e]).mul(0.5).add(0.5)
-                #         else:
-                #             source_vis = source[e].mul(0.5).add(0.5)
-                #             fft_output_vis = fft_output[e].mul(0.5).add(0.5)
-
-                #         fft_output_vis = (fft_output_vis - fft_output_vis.min()) / (
-                #             fft_output_vis.max() - fft_output_vis.min()
-                #         )
-
-                #         fft_output_vis = (fft_output_vis - fft_output_vis.min()) / (
-                #             fft_output_vis.max() - fft_output_vis.min()
-                #         )
-
-                #         output_vis = output[e].mul(0.5).add(0.5)
-
-                #         writer.add_image(
-                #             f"{interm_name}/Test_{e + 1}",
-                #             fft_output_vis.cpu().detach(),
-                #             global_step,
-                #         )
-
-                #         writer.add_image(
-                #             f"Source/Test_{e+1}", source_vis.cpu().detach(), global_step
-                #         )
-
-                #         writer.add_image(
-                #             f"Output/Test_{e+1}", output_vis.cpu().detach(), global_step
-                #         )
-
-                #         writer.add_text(
-                #             f"Filename/Test_{e + 1}", filename[e], global_step
-                #         )
-
-                #     for e, filename in enumerate(filename_static):
-                #         if filename == args.static_test_image:
-                #             if not is_admm:
-                #                 source_vis = (
-                #                     rggb_2_rgb(source_static[e]).mul(0.5).add(0.5)
-                #                 )
-                #                 fft_output_vis = (
-                #                     rggb_2_rgb(fft_output_static[e]).mul(0.5).add(0.5)
-                #                 )
-                #             else:
-                #                 source_vis = source_static[e].mul(0.5).add(0.5)
-                #                 fft_output_vis = fft_output_static[e].mul(0.5).add(0.5)
-
-                #             fft_output_vis = (fft_output_vis - fft_output_vis.min()) / (
-                #                 fft_output_vis.max() - fft_output_vis.min()
-                #             )
-
-                #             output_vis = output_static[e].mul(0.5).add(0.5)
-
-                #             writer.add_image(
-                #                 f"{interm_name}/Test_Static",
-                #                 fft_output_vis.cpu().detach(),
-                #                 global_step,
-                #             )
-
-                #             writer.add_image(
-                #                 f"Source/Test_Static",
-                #                 source_vis.cpu().detach(),
-                #                 global_step,
-                #             )
-
-                #             writer.add_image(
-                #                 f"Output/Test_Static",
-                #                 output_vis.cpu().detach(),
-                #                 global_step,
-                #             )
-
-                #             writer.add_text(
-                #                 f"Filename/Test_Static", filename[e], global_step
-                #             )
-
-                #             break
-
-                #     test_pbar.refresh()
+                            writer.add_image(
+                                f"{interm_name}/Test_{e + 1}",
+                                fft_output_vis.cpu().detach(),
+                                global_step,
+                            )
+                            writer.add_image(
+                                f"Source/Test_{e+1}", source_vis.cpu().detach(), global_step
+                            )
+                            writer.add_image(
+                                f"Output/Test_{e+1}", output_vis.cpu().detach(), global_step
+                            )
+                            writer.add_text(
+                                f"Filename/Test_{e + 1}", filename[e], global_step
+                            )
 
     except KeyboardInterrupt:
         if is_local_rank_0:
